@@ -1,47 +1,54 @@
-"""Turn-of-month gasoline short: last 2 + first 3 completed sessions of month, RB 08:35-14:50 CT, real protective stop.
-Rationale: month-end refiner/index-fund rebalancing flow in front-month RBOB. Offline gross +$131/trade after stressed cost, all 3 eras positive."""
+"""Stop-run sweep-and-revert: price pokes beyond prior RTH high/low then closes back inside the range -> fade, stop at sweep extreme.
+One trade per session per symbol, hold to exit_sec."""
 import numpy as np
 import pandas as pd
 from instruments import SPECS
 
-FAMILY = "energy-turn-of-month-short"
-PARAMS = {"stop_price": 0.0070, "tom_tail": 2, "tom_head": 3, "entry_sec": 30900, "exit_sec": 53000}
-SYMBOLS = ("RB",)
+FAMILY = "prior-extreme-sweep-revert"
+PARAMS = {"entry_start": 31200, "entry_end": 46800, "exit_sec": 53000, "min_stop_frac": 0.1, "max_risk": 290}
+SYMBOLS = ("MES", "MNQ", "MGC", "M6E")
 
 
-def _flags(d):
-    sess = d.session.astype(str)
-    days = pd.Series(pd.to_datetime(sess.unique()))
-    ym = days.dt.to_period("M")
-    # head: position within month known causally; tail needs next-day knowledge -> use calendar: last PARAMS['tom_tail'] business days via bday calendar
-    bd = pd.offsets.BDay()
-    is_tail = (days + bd * PARAMS["tom_tail"]).dt.to_period("M") != ym
-    is_head = days.groupby(ym).cumcount() < PARAMS["tom_head"]
-    return pd.Series((is_tail | is_head).to_numpy(), index=sess.unique())
+def _run(d, s):
+    sec, sess = d.ct_sec.to_numpy(), d.session.astype(str).to_numpy()
+    close, hi, lo = d.close.to_numpy(), d.high.to_numpy(), d.low.to_numpy()
+    rth = (sec >= 30600) & (sec < 53400)
+    g = pd.DataFrame({"s": sess[rth], "h": hi[rth], "l": lo[rth]}).groupby("s", sort=True)
+    ph, pl = g.h.max().shift(1).reindex(sess).to_numpy(), g.l.min().shift(1).reindex(sess).to_numpy()
+    pv = SPECS[s].point_value
+    out, risk = np.zeros(len(d), dtype=np.int64), np.zeros(len(d))
+    bounds = np.flatnonzero(np.r_[True, sess[1:] != sess[:-1], True])
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        rng = ph[a] - pl[a]
+        if not np.isfinite(rng) or rng <= 0:
+            continue
+        hi_run, lo_run, side, stop = -np.inf, np.inf, 0, 0.0
+        for j in range(a, b):
+            if sec[j] >= PARAMS["exit_sec"]:
+                break
+            if side == 0 and PARAMS["entry_start"] <= sec[j] < PARAMS["entry_end"]:
+                hi_run, lo_run = max(hi_run, hi[j]), min(lo_run, lo[j])
+                if hi_run > ph[j] and close[j] < ph[j] and hi_run - close[j] >= PARAMS["min_stop_frac"] * rng * 0.1:
+                    side, stop = -1, hi_run
+                elif lo_run < pl[j] and close[j] > pl[j]:
+                    side, stop = 1, lo_run
+                if side:
+                    risk[j:b] = abs(close[j] - stop) * pv
+                    if risk[j] > PARAMS["max_risk"] or risk[j] == 0:
+                        side = 2
+                        continue
+                    out[j] = side
+            elif side in (1, -1):
+                if (close[j] - stop) * side <= 0 and (hi[j] >= stop if side == -1 else lo[j] <= stop):
+                    side = 2
+                    continue
+                out[j] = side
+    return out, risk
 
 
 def signals(panel):
-    result = {}
-    for s, d in panel.items():
-        out = np.zeros(len(d), dtype=np.int64)
-        if s in SYMBOLS:
-            sec, sess, close = d.ct_sec.to_numpy(), d.session.astype(str), d.close.to_numpy()
-            flag = sess.map(_flags(d)).fillna(False).to_numpy(dtype=bool)
-            for idx in d.groupby(sess, sort=False).indices.values():
-                if not flag[idx[0]]:
-                    continue
-                entry = None
-                for j in idx:
-                    if sec[j] < PARAMS["entry_sec"] or sec[j] >= PARAMS["exit_sec"]:
-                        continue
-                    if entry is None:
-                        entry = close[j]
-                    if close[j] - entry >= PARAMS["stop_price"]:
-                        break
-                    out[j] = -1
-        result[s] = out
-    return result
+    return {s: (_run(d, s)[0] if s in SYMBOLS else np.zeros(len(d), dtype=np.int64)) for s, d in panel.items()}
 
 
 def entry_risk(panel):
-    return {s: np.full(len(d), PARAMS["stop_price"] * SPECS[s].point_value if s in SYMBOLS else 0.0) for s, d in panel.items()}
+    return {s: (_run(d, s)[1] if s in SYMBOLS else np.zeros(len(d))) for s, d in panel.items()}
