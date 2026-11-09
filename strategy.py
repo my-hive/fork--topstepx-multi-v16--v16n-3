@@ -1,73 +1,22 @@
-"""v16n-3: energy opening-move continuation, vol-gated, one trade/session, protective stop.
-Move = 08:30 open -> 09:00 close (CT). Trade only if |move| > z * trailing mean |move| (prior sessions).
-Hold to exit_ct. Stop = stop_mult * trailing mean |move| from entry; declared as entry risk."""
+"""NQ prior-session RTH return reversal (overreaction of last day's index move), 1 contract."""
 import numpy as np
-from instruments import SPECS
-
-FAMILY = "energy-open-move-continuation"
-PARAMS = {"z": 1.5, "stop_mult": 2.0, "window": 40, "exit_ct": 14 * 3600 + 50 * 60}
-SYMBOLS = ("QM", "QG")
-OPEN, DECIDE = 8 * 3600 + 30 * 60, 9 * 3600
-
-
-def _state(df):
-    sec = df.ct_sec.to_numpy()
-    close, opn = df.close.to_numpy(), df.open.to_numpy()
-    groups = list(df.groupby("session", sort=False).indices.values())
-    info = []
-    for g in groups:
-        s = sec[g]
-        a = np.flatnonzero((s >= OPEN) & (s < DECIDE))
-        d = np.flatnonzero((s >= DECIDE) & (s < 15 * 3600))
-        if not len(a) or not len(d) or d[0] <= a[0] or s[d[0]] > DECIDE + 120:
-            info.append(None)
-            continue
-        info.append((g, g[d[0]], opn[g[a[0]]], close[g[d[0]]]))
-    return sec, close, info
-
-
+import pandas as pd
+FAMILY = "index-prior-day-reversal"
+PARAMS = {"rth_start": 30600, "rth_end": 53400, "entry_sec": 34200, "exit_sec": 53000, "risk_points": 14, "vol_lookback": 20}
 def signals(panel):
-    result = {}
-    for symbol, df in panel.items():
-        out = np.zeros(len(df), dtype=np.int64)
-        if symbol in SYMBOLS:
-            sec, close, info = _state(df)
-            hist = []
-            for it in info:
-                if it is None:
-                    continue
-                g, di, o, c = it
-                mv = abs(c - o)
-                if len(hist) >= PARAMS["window"]:
-                    avg = np.mean(hist[-PARAMS["window"]:])
-                    if avg > 0 and mv > PARAMS["z"] * avg and c != o:
-                        side = int(np.sign(c - o))
-                        stop = c - side * PARAMS["stop_mult"] * avg
-                        for j in g[g > di]:
-                            if sec[j] >= PARAMS["exit_ct"] or (close[j] - stop) * side <= 0:
-                                break
-                            out[j] = side
-                        out[di] = side
-                hist.append(mv)
-        result[symbol] = out
+    result={}
+    for s,d in panel.items():
+        out=np.zeros(len(d),dtype=np.int64)
+        if s!='NQ': result[s]=out; continue
+        sec=d.ct_sec.to_numpy(); sess=d.session.astype(str)
+        rth=(sec>=PARAMS['rth_start'])&(sec<PARAMS['rth_end'])
+        g=d[rth].groupby(sess[rth])
+        ret=g.close.last()-g.open.first()
+        prior_range=(g.high.max()-g.low.min())
+        high_vol=prior_range.shift(1) > prior_range.shift(1).rolling(PARAMS['vol_lookback']).median()
+        side=-np.sign(ret).shift(1)*high_vol  # prior session return; prior-only volatility gate
+        m=sess.map(pd.Series(side.to_numpy(),index=ret.index.astype(str))).fillna(0).to_numpy()
+        a=(sec>=PARAMS['entry_sec'])&(sec<PARAMS['exit_sec'])
+        out[a]=m[a].astype(np.int64); result[s]=out
     return result
-
-
-def entry_risk(panel):
-    result = {}
-    for symbol, df in panel.items():
-        r = np.zeros(len(df))
-        if symbol in SYMBOLS:
-            sec, close, info = _state(df)
-            hist = []
-            for it in info:
-                if it is None:
-                    continue
-                g, di, o, c = it
-                mv = abs(c - o)
-                if len(hist) >= PARAMS["window"]:
-                    avg = np.mean(hist[-PARAMS["window"]:])
-                    r[g] = PARAMS["stop_mult"] * avg * SPECS[symbol].point_value
-                hist.append(mv)
-        result[symbol] = r
-    return result
+def entry_risk(panel): return {s:np.full(len(d),PARAMS['risk_points']*20.0,dtype=float) for s,d in panel.items()}
