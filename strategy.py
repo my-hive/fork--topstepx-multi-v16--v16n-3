@@ -1,42 +1,32 @@
-"""Asia-to-London FX reversal: fade completed 18:00-07:00 CT move, hold London morning.
-One trade per session, causal fixed-dollar protective stop."""
+"""Prior US-session gold overreaction: fade yesterday RTH direction in next US session."""
 import numpy as np
-from instruments import SPECS
+import pandas as pd
 
-FAMILY = "fx-asia-london-reversal"
-PARAMS = {"asia_start": 64800, "entry_sec": 25200, "exit_sec": 36000, "stop_risk": 250}
-SYMBOLS = ("M6E", "M6B", "M6A")
+FAMILY = "metals-overnight-gap-fade"
+PARAMS = {"rth_start": 30600, "entry_sec": 34200, "exit_sec": 53000, "stop_risk": 290}
+TRADED = "MGC"
 
-def _run(d, symbol):
+
+def _run(d):
     sec = d.ct_sec.to_numpy()
-    session = d.session.astype(str).to_numpy()
-    close, high, low = d.close.to_numpy(), d.high.to_numpy(), d.low.to_numpy()
-    target, risk = np.zeros(len(d), dtype=np.int64), np.zeros(len(d))
-    pv = SPECS[symbol].point_value
-    bounds = np.flatnonzero(np.r_[True, session[1:] != session[:-1], True])
-    for a, b in zip(bounds[:-1], bounds[1:]):
-        start = np.flatnonzero(sec[a:b] >= PARAMS["asia_start"])
-        entry = np.flatnonzero((sec[a:b] >= PARAMS["entry_sec"]) & (sec[a:b] < PARAMS["asia_start"]))
-        if not len(start) or not len(entry):
-            continue
-        i0, i = a + start[0], a + entry[0]
-        if i <= i0 or sec[i] >= PARAMS["exit_sec"]:
-            continue
-        side = -int(np.sign(close[i - 1] - close[i0]))
-        if not side:
-            continue
-        stop = close[i - 1] - side * PARAMS["stop_risk"] / pv
-        risk[i:b] = PARAMS["stop_risk"]
-        for j in range(i, b):
-            if sec[j] >= PARAMS["exit_sec"]:
-                break
-            if (side > 0 and low[j] <= stop) or (side < 0 and high[j] >= stop):
-                break
-            target[j] = side
+    sess = d.session.astype(str)
+    rth = (sec >= PARAMS["rth_start"]) & (sec < PARAMS["exit_sec"])
+    g = d[rth].groupby(sess[rth])
+    prior_move = (g.close.last() - g.open.first()).shift(1)
+    side = -np.sign(prior_move)
+    by_session = pd.Series(side.to_numpy(), index=prior_move.index.astype(str))
+    target = np.zeros(len(d), dtype=np.int64)
+    current = sess.map(by_session).fillna(0).to_numpy(dtype=np.int64)
+    active = (sec >= PARAMS["entry_sec"]) & (sec < PARAMS["exit_sec"])
+    target[active] = current[active]
+    risk = np.zeros(len(d))
+    risk[np.flatnonzero(np.diff(np.r_[0, target]) != 0)] = PARAMS["stop_risk"]
     return target, risk
 
+
 def signals(panel):
-    return {s: _run(d, s)[0] if s in SYMBOLS else np.zeros(len(d), dtype=np.int64) for s, d in panel.items()}
+    return {s: _run(d)[0] if s == TRADED else np.zeros(len(d), dtype=np.int64) for s, d in panel.items()}
+
 
 def entry_risk(panel):
-    return {s: _run(d, s)[1] if s in SYMBOLS else np.zeros(len(d)) for s, d in panel.items()}
+    return {s: _run(d)[1] if s == TRADED else np.zeros(len(d)) for s, d in panel.items()}
