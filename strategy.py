@@ -1,67 +1,47 @@
-"""Prior-session range breakout (first break only), one trade/session, real protective stop.
-Long when price first closes above prior-session high (US hours), short below prior low. Stop at entry -/+ stop_frac*prior range.
-Hold to exit_sec. Declared risk = stop distance * point value (<= $300 enforced by skipping oversized stops)."""
+"""Turn-of-month gasoline short: last 2 + first 3 completed sessions of month, RB 08:35-14:50 CT, real protective stop.
+Rationale: month-end refiner/index-fund rebalancing flow in front-month RBOB. Offline gross +$131/trade after stressed cost, all 3 eras positive."""
 import numpy as np
 import pandas as pd
 from instruments import SPECS
 
-FAMILY = "prior-range-breakout-stop"
-PARAMS = {"stop_frac": 0.5, "entry_start": 30600, "entry_end": 46800, "exit_sec": 53000, "max_risk": 290}
-SYMBOLS = ("MGC", "M6E", "M6B", "M6A")
+FAMILY = "energy-turn-of-month-short"
+PARAMS = {"stop_price": 0.0070, "tom_tail": 2, "tom_head": 3, "entry_sec": 30900, "exit_sec": 53000}
+SYMBOLS = ("RB",)
 
 
-def _prep(d, s):
-    sec, sess = d.ct_sec.to_numpy(), d.session.astype(str).to_numpy()
-    close, hi, lo = d.close.to_numpy(), d.high.to_numpy(), d.low.to_numpy()
-    rth = (sec >= 30600) & (sec < 53400)
-    g = pd.DataFrame({"s": sess[rth], "h": hi[rth], "l": lo[rth]}).groupby("s", sort=True)
-    ph, pl = g.h.max().shift(1), g.l.min().shift(1)
-    return sec, sess, close, ph.reindex(sess).to_numpy(), pl.reindex(sess).to_numpy()
-
-
-def _run(d, s):
-    sec, sess, close, ph, pl = _prep(d, s)
-    pv = SPECS[s].point_value
-    out = np.zeros(len(d), dtype=np.int64)
-    risk = np.zeros(len(d))
-    start = 0
-    for i in range(1, len(d) + 1):
-        if i < len(d) and sess[i] == sess[start]:
-            continue
-        idx = np.arange(start, i); start = i
-        rng = ph[idx[0]] - pl[idx[0]]
-        if not np.isfinite(rng) or rng <= 0:
-            continue
-        stop_d = PARAMS["stop_frac"] * rng
-        r = stop_d * pv
-        risk[idx] = r
-        if r > PARAMS["max_risk"]:
-            continue
-        side, stop = 0, 0.0
-        for j in idx:
-            if sec[j] >= PARAMS["exit_sec"]:
-                break
-            if side == 0 and PARAMS["entry_start"] <= sec[j] < PARAMS["entry_end"] and not done_flag(out, idx, j):
-                if close[j] > ph[j]:
-                    side, stop = 1, close[j] - stop_d
-                elif close[j] < pl[j]:
-                    side, stop = -1, close[j] + stop_d
-            elif side != 0 and (close[j] - stop) * side <= 0:
-                out[j] = 0
-                side = 2  # stopped, no re-entry
-                continue
-            if side in (1, -1):
-                out[j] = side
-    return out, risk
-
-
-def done_flag(out, idx, j):
-    return False
+def _flags(d):
+    sess = d.session.astype(str)
+    days = pd.Series(pd.to_datetime(sess.unique()))
+    ym = days.dt.to_period("M")
+    # head: position within month known causally; tail needs next-day knowledge -> use calendar: last PARAMS['tom_tail'] business days via bday calendar
+    bd = pd.offsets.BDay()
+    is_tail = (days + bd * PARAMS["tom_tail"]).dt.to_period("M") != ym
+    is_head = days.groupby(ym).cumcount() < PARAMS["tom_head"]
+    return pd.Series((is_tail | is_head).to_numpy(), index=sess.unique())
 
 
 def signals(panel):
-    return {s: (_run(d, s)[0] if s in SYMBOLS else np.zeros(len(d), dtype=np.int64)) for s, d in panel.items()}
+    result = {}
+    for s, d in panel.items():
+        out = np.zeros(len(d), dtype=np.int64)
+        if s in SYMBOLS:
+            sec, sess, close = d.ct_sec.to_numpy(), d.session.astype(str), d.close.to_numpy()
+            flag = sess.map(_flags(d)).fillna(False).to_numpy(dtype=bool)
+            for idx in d.groupby(sess, sort=False).indices.values():
+                if not flag[idx[0]]:
+                    continue
+                entry = None
+                for j in idx:
+                    if sec[j] < PARAMS["entry_sec"] or sec[j] >= PARAMS["exit_sec"]:
+                        continue
+                    if entry is None:
+                        entry = close[j]
+                    if close[j] - entry >= PARAMS["stop_price"]:
+                        break
+                    out[j] = -1
+        result[s] = out
+    return result
 
 
 def entry_risk(panel):
-    return {s: (_run(d, s)[1] if s in SYMBOLS else np.zeros(len(d))) for s, d in panel.items()}
+    return {s: np.full(len(d), PARAMS["stop_price"] * SPECS[s].point_value if s in SYMBOLS else 0.0) for s, d in panel.items()}
