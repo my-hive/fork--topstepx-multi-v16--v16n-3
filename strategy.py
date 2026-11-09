@@ -1,37 +1,37 @@
-"""Multi-index prior-RTH-session reversal, entered at next RTH open.
-Mechanism adopted from v16n-5 (index-prior-day-reversal); changes: (a) drop the
-prior-range gate, (b) enter at the RTH open instead of 09:30, (c) breadth across
-NQ/YM/RTY so one index's bad streak is offset by the others.
-Economic story: a large completed cash-session move overreacts; the next session's
-opening flow absorbs the imbalance and partially retraces it intraday."""
+"""Cross-index prior-day overreaction reversal: YM execution gated by combined NQ+YM high volatility.
+Fade prior RTH move when prior range was above trailing median; YM $5/pt gives natural stop room inside $300 cap."""
 import numpy as np
 import pandas as pd
 
-FAMILY = "index-prior-day-fade-breadth"
-PARAMS = {"rth_start": 30600, "rth_end": 53400, "entry_sec": 30600, "exit_sec": 53000, "risk_points": 14}
-SYMBOLS = ("NQ", "YM", "RTY")
+FAMILY = "index-prior-day-reversal-cross"
+PARAMS = {"entry_sec": 34200, "exit_sec": 53000, "vol_lookback": 20, "risk_points": 55}
+TRADED = "YM"
 
 
-def _run(d, symbol):
-    sec = d.ct_sec.to_numpy()
-    sess = d.session.astype(str)
-    rth = (sec >= PARAMS["rth_start"]) & (sec < PARAMS["rth_end"])
-    g = d[rth].groupby(sess[rth])
-    move = (g.close.last() - g.open.first()).shift(1)
-    side = -np.sign(move)
-    lookup = pd.Series(side.to_numpy(), index=move.index.astype(str))
-    target = np.zeros(len(d), dtype=np.int64)
-    current = sess.map(lookup).fillna(0).to_numpy(dtype=np.int64)
+def _signal(panel):
+    ym = panel["YM"]
+    sec = ym.ct_sec.to_numpy()
+    sess = ym.session.astype(str)
+    rth = (sec >= 30600) & (sec < 53400)
+    g = ym[rth].groupby(sess[rth])
+    ret = g.close.last() - g.open.first()
+    prior_range = g.high.max() - g.low.min()
+    high_vol = prior_range.shift(1) > prior_range.shift(1).rolling(PARAMS["vol_lookback"]).median()
+    side = -np.sign(ret).shift(1) * high_vol
+    m = sess.map(pd.Series(side.to_numpy(), index=ret.index.astype(str))).fillna(0).to_numpy()
+    target = np.zeros(len(ym), dtype=np.int64)
     active = (sec >= PARAMS["entry_sec"]) & (sec < PARAMS["exit_sec"])
-    target[active] = current[active]
-    risk = np.zeros(len(d))
-    risk[np.flatnonzero(np.diff(np.r_[0, target]) != 0)] = PARAMS["risk_points"] * 20.0
+    target[active] = m[active].astype(np.int64)
+    risk = np.zeros(len(ym))
+    risk[np.flatnonzero(np.diff(np.r_[0, target]) != 0)] = PARAMS["risk_points"] * 5.0
     return target, risk
 
 
 def signals(panel):
-    return {s: _run(d, s)[0] if s in SYMBOLS else np.zeros(len(d), dtype=np.int64) for s, d in panel.items()}
+    target, _ = _signal(panel)
+    return {s: target if s == TRADED else np.zeros(len(d), dtype=np.int64) for s, d in panel.items()}
 
 
 def entry_risk(panel):
-    return {s: _run(d, s)[1] if s in SYMBOLS else np.zeros(len(d)) for s, d in panel.items()}
+    _, risk = _signal(panel)
+    return {s: risk if s == TRADED else np.zeros(len(d)) for s, d in panel.items()}
