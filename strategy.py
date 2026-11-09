@@ -1,48 +1,67 @@
-"""Walk-forward NQ daily direction classifier, executed intraday only.
-Features use completed prior sessions: overnight gap, prior return/range, 3/10-session returns.
-Refit logistic classifier every 60 sessions using last 1,000 completed sessions."""
+"""Prior-session range breakout (first break only), one trade/session, real protective stop.
+Long when price first closes above prior-session high (US hours), short below prior low. Stop at entry -/+ stop_frac*prior range.
+Hold to exit_sec. Declared risk = stop distance * point value (<= $300 enforced by skipping oversized stops)."""
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
+from instruments import SPECS
 
-FAMILY = "index-walkforward-daily-classifier"
-PARAMS = {"train_sessions": 1000, "refit_sessions": 60, "warmup_sessions": 500, "confidence": 0.03, "entry_sec": 30900, "exit_sec": 53100, "risk_dollars": 250}
-SYMBOLS = ("NQ",)
+FAMILY = "prior-range-breakout-stop"
+PARAMS = {"stop_frac": 0.5, "entry_start": 30600, "entry_end": 46800, "exit_sec": 53000, "max_risk": 290}
+SYMBOLS = ("MGC", "M6E", "M6B", "M6A")
 
 
-def entry_risk(panel):
-    return {s: np.full(len(d), PARAMS["risk_dollars"], dtype=float) for s, d in panel.items()}
+def _prep(d, s):
+    sec, sess = d.ct_sec.to_numpy(), d.session.astype(str).to_numpy()
+    close, hi, lo = d.close.to_numpy(), d.high.to_numpy(), d.low.to_numpy()
+    rth = (sec >= 30600) & (sec < 53400)
+    g = pd.DataFrame({"s": sess[rth], "h": hi[rth], "l": lo[rth]}).groupby("s", sort=True)
+    ph, pl = g.h.max().shift(1), g.l.min().shift(1)
+    return sec, sess, close, ph.reindex(sess).to_numpy(), pl.reindex(sess).to_numpy()
+
+
+def _run(d, s):
+    sec, sess, close, ph, pl = _prep(d, s)
+    pv = SPECS[s].point_value
+    out = np.zeros(len(d), dtype=np.int64)
+    risk = np.zeros(len(d))
+    start = 0
+    for i in range(1, len(d) + 1):
+        if i < len(d) and sess[i] == sess[start]:
+            continue
+        idx = np.arange(start, i); start = i
+        rng = ph[idx[0]] - pl[idx[0]]
+        if not np.isfinite(rng) or rng <= 0:
+            continue
+        stop_d = PARAMS["stop_frac"] * rng
+        r = stop_d * pv
+        risk[idx] = r
+        if r > PARAMS["max_risk"]:
+            continue
+        side, stop = 0, 0.0
+        for j in idx:
+            if sec[j] >= PARAMS["exit_sec"]:
+                break
+            if side == 0 and PARAMS["entry_start"] <= sec[j] < PARAMS["entry_end"] and not done_flag(out, idx, j):
+                if close[j] > ph[j]:
+                    side, stop = 1, close[j] - stop_d
+                elif close[j] < pl[j]:
+                    side, stop = -1, close[j] + stop_d
+            elif side != 0 and (close[j] - stop) * side <= 0:
+                out[j] = 0
+                side = 2  # stopped, no re-entry
+                continue
+            if side in (1, -1):
+                out[j] = side
+    return out, risk
+
+
+def done_flag(out, idx, j):
+    return False
 
 
 def signals(panel):
-    result = {}
-    for s, d in panel.items():
-        out = np.zeros(len(d), dtype=np.int64)
-        if s not in SYMBOLS:
-            result[s] = out
-            continue
-        sec, sess = d.ct_sec.to_numpy(), d.session.astype(str)
-        def agg(lo, hi, col, fn):
-            return d[(sec >= lo) & (sec < hi)].groupby(sess[(sec >= lo) & (sec < hi)])[col].agg(fn)
-        o, c = agg(30900, 30960, "open", "first"), agg(53000, 53100, "close", "last")
-        pre, h, l = agg(30000, 30600, "close", "last"), agg(30600, 53400, "high", "max"), agg(30600, 53400, "low", "min")
-        x = pd.concat({"o": o, "c": c, "pre": pre, "h": h, "l": l}, axis=1).dropna()
-        ret = np.log(x.c / x.o)
-        vol = ret.abs().rolling(PARAMS["refit_sessions"]).mean().shift(1)
-        features = pd.DataFrame({"gap": np.log(x.o / x.pre), "prev": ret.shift(1), "range": np.log(x.h / x.l).shift(1), "p3": np.log(x.c).diff(3).shift(1), "p10": np.log(x.c).diff(10).shift(1)}).div(vol, axis=0).clip(-5, 5)
-        ok = features.dropna().index
-        f, y = features.loc[ok], (ret.loc[ok] > 0).astype(int)
-        side = np.zeros(len(f), dtype=np.int64)
-        model = None
-        for i in range(PARAMS["warmup_sessions"], len(f)):
-            if i % PARAMS["refit_sessions"] == 0:
-                a = max(0, i - PARAMS["train_sessions"])
-                model = LogisticRegression(C=0.1).fit(f.iloc[a:i], y.iloc[a:i])
-            if model is not None:
-                p = model.predict_proba(f.iloc[i:i + 1])[0, 1] - 0.5
-                side[i] = int(np.sign(p)) if abs(p) >= PARAMS["confidence"] else 0
-        mapped = sess.map(pd.Series(side, index=f.index.astype(str))).fillna(0).to_numpy(dtype=np.int64)
-        active = (sec >= PARAMS["entry_sec"]) & (sec < PARAMS["exit_sec"])
-        out[active] = mapped[active]
-        result[s] = out
-    return result
+    return {s: (_run(d, s)[0] if s in SYMBOLS else np.zeros(len(d), dtype=np.int64)) for s, d in panel.items()}
+
+
+def entry_risk(panel):
+    return {s: (_run(d, s)[1] if s in SYMBOLS else np.zeros(len(d))) for s, d in panel.items()}
