@@ -1,26 +1,34 @@
-"""Treasury auction-day drift: long 5-year note (ZF) Tue-Thu 12:00-15:00 CT.
-Auction allocation leaves dealers short duration; covering creates modest afternoon bid."""
+"""NQ prior-session RTH return reversal with 45-session trailing median range gate.
+Longer window smooths regime transitions across low-vol years (2011-2012, 2015, 2019)."""
 import numpy as np
+import pandas as pd
 
-FAMILY = "rates-auction-day-drift"
-PARAMS = {"entry_sec": 43200, "exit_sec": 54000, "stop_risk": 280, "first_auction_dow": 1, "last_auction_dow": 3}
-TRADED = "ZF"
-
-
-def _run(d):
-    sec = d.ct_sec.to_numpy()
-    dow = d.index.tz_convert("America/Chicago").day_of_week.to_numpy()
-    auction = (dow >= PARAMS["first_auction_dow"]) & (dow <= PARAMS["last_auction_dow"])
-    active = auction & (sec >= PARAMS["entry_sec"]) & (sec < PARAMS["exit_sec"])
-    target = active.astype(np.int64)
-    risk = np.zeros(len(d))
-    risk[np.flatnonzero(np.diff(np.r_[0, target]) > 0)] = PARAMS["stop_risk"]
-    return target, risk
+FAMILY = "index-prior-day-reversal"
+PARAMS = {"rth_start": 30600, "rth_end": 53400, "entry_sec": 34200, "exit_sec": 53000, "risk_points": 14, "vol_lookback": 45}
+TRADED = "NQ"
 
 
 def signals(panel):
-    return {s: _run(d)[0] if s == TRADED else np.zeros(len(d), dtype=np.int64) for s, d in panel.items()}
+    result = {}
+    for s, d in panel.items():
+        out = np.zeros(len(d), dtype=np.int64)
+        if s != TRADED:
+            result[s] = out
+            continue
+        sec = d.ct_sec.to_numpy()
+        sess = d.session.astype(str)
+        rth = (sec >= PARAMS["rth_start"]) & (sec < PARAMS["rth_end"])
+        g = d[rth].groupby(sess[rth])
+        ret = g.close.last() - g.open.first()
+        prior_range = g.high.max() - g.low.min()
+        high_vol = prior_range.shift(1) > prior_range.shift(1).rolling(PARAMS["vol_lookback"]).median()
+        side = -np.sign(ret).shift(1) * high_vol
+        m = sess.map(pd.Series(side.to_numpy(), index=ret.index.astype(str))).fillna(0).to_numpy()
+        a = (sec >= PARAMS["entry_sec"]) & (sec < PARAMS["exit_sec"])
+        out[a] = m[a].astype(np.int64)
+        result[s] = out
+    return result
 
 
 def entry_risk(panel):
-    return {s: _run(d)[1] if s == TRADED else np.zeros(len(d)) for s, d in panel.items()}
+    return {s: np.full(len(d), PARAMS["risk_points"] * 20.0, dtype=float) for s, d in panel.items()}
